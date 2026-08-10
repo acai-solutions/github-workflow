@@ -71,7 +71,11 @@ jobs:
     outputs:
       all_checks_passed: ${{ steps.determine_status.outputs.all_passed }}
       tflint_status: ${{ steps.tflint.outcome }}
-      trivy_status: ${{ steps.trivy_reviewdog.outcome || steps.trivy_scan.outcome }}   # Fixed
+      # Derived from the scan itself, never from the reviewdog reporter: failing to POST
+      # annotations (e.g. a 404 on the check-run PATCH) is a reporting problem, not a
+      # security finding. The old `a.outcome || b.outcome` never reached the fallback
+      # either — `outcome` is always a non-empty string, so 'failure' short-circuits.
+      trivy_status: ${{ steps.trivy_gate.outputs.status || 'success' }}
       checkov_status: ${{ steps.checkov.outcome }}
     steps:
       - name: Checkout Repository
@@ -168,6 +172,8 @@ jobs:
           fi
 
       # --- Trivy (for PRs: reviewdog, for pushes/schedules: SARIF) ---
+      # Annotations only. The pass/fail decision lives in `trivy_gate` below, so a
+      # reviewdog transport error must not be turned into a scan failure.
       - name: Run Trivy (PR annotations via reviewdog)
         if: ${{ github.event_name == 'pull_request' }}
         id: trivy_reviewdog
@@ -176,7 +182,7 @@ jobs:
         with:
           github_token: ${{ github.token }}
           reporter: github-pr-check
-          fail_on_error: true
+          fail_on_error: false
           filter_mode: nofilter
           level: error
           flags: ""
@@ -213,11 +219,34 @@ jobs:
         with:
           sarif_file: trivy-results.sarif
 
-      - name: Capture Trivy findings for autofix
+      # Authoritative Trivy result for both PR and push events: this is the only step
+      # whose outcome feeds `trivy_status`. It also produces the findings file the
+      # autofix job consumes, so the gate and the autofix always see the same scan.
+      - name: Run Trivy gate + capture findings for autofix
+        id: trivy_gate
         if: always()
         run: |
-          trivy config . --severity CRITICAL,HIGH --timeout 10m \
-            --skip-dirs examples,.terraform > trivy-findings.txt 2>&1 || true
+          set +e
+          trivy config . --exit-code 1 --severity CRITICAL,HIGH --timeout 10m \
+            --skip-dirs examples,.terraform > trivy-findings.txt 2>&1
+          rc=$?
+          set -e
+          cat trivy-findings.txt
+
+          case "${rc}" in
+            0)
+              echo "✅ Trivy found no CRITICAL/HIGH misconfigurations"
+              echo "status=success" >> "$GITHUB_OUTPUT"
+              ;;
+            1)
+              echo "❌ Trivy found CRITICAL/HIGH misconfigurations"
+              echo "status=failure" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "❌ Trivy itself failed to run (exit ${rc})"
+              echo "status=failure" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
           echo "📦 Trivy text findings captured for autofix"
 
       - name: Run Checkov Security Scan
@@ -284,8 +313,13 @@ jobs:
         if: always()
         run: |
           TFLINT_RESULT="${{ steps.tflint.outcome }}"
-          TRIVY_RESULT="${{ steps.trivy_reviewdog.outcome || steps.trivy_scan.outcome }}"
+          # From the scan, not from the reporter — see the trivy_status output above.
+          TRIVY_RESULT="${{ steps.trivy_gate.outputs.status || 'success' }}"
           CHECKOV_RESULT="${{ steps.checkov.outcome }}"
+
+          if [[ "${{ steps.trivy_reviewdog.outcome }}" == "failure" ]]; then
+            echo "⚠️ reviewdog could not publish Trivy annotations — not treated as a scan failure"
+          fi
 
           if [[ "${{ inputs.hcl_lint_include }}" == "true" && "$TFLINT_RESULT" != "success" ]]; then
             echo "all_passed=false" >> "$GITHUB_OUTPUT"

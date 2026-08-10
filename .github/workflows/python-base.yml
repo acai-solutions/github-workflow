@@ -69,8 +69,12 @@ jobs:
     if: ${{ inputs.py_lint_include }}
     runs-on: ${{ inputs.runner_type }}
     outputs:
-      black_status: ${{ steps.black_commit.outputs.diff == 'false' && 'success' || 'failure' }}
-      
+      # Reformatting is a fix, not a finding. This job applies Black and pushes the
+      # result, so "Black changed something" must not fail the pipeline — otherwise
+      # every auto-format run is red AND pushes a commit that starts the next run.
+      # What the gate should assert is that the tree is Black-clean afterwards.
+      black_status: ${{ steps.black_verify.outcome == 'success' && 'success' || 'failure' }}
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v6
@@ -106,6 +110,14 @@ jobs:
           black .
           echo "✅ Black formatting applied"
 
+      # The actual pass/fail criterion: is the tree Black-clean now? Passes when there
+      # was nothing to do and when Black fixed it; fails only if Black cannot produce a
+      # clean tree (e.g. unparsable source, exit 123).
+      - name: Verify Black Formatting
+        id: black_verify
+        continue-on-error: true
+        run: black --check .
+
       - name: Commit and Push Changes
         id: black_commit
         run: |
@@ -131,8 +143,9 @@ jobs:
     needs: python_black
     runs-on: ${{ inputs.runner_type }}
     outputs:
-      isort_status: ${{ steps.isort_commit.outputs.diff == 'false' && 'success' || 'failure' }}
-      
+      # Same reasoning as black_status above: sorting imports is a fix, not a finding.
+      isort_status: ${{ steps.isort_verify.outcome == 'success' && 'success' || 'failure' }}
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v6
@@ -171,6 +184,13 @@ jobs:
           echo "Applying import sorting..."
           isort . --profile black
           echo "✅ Import sorting applied"
+
+      # Verify with the same profile that was applied, otherwise a --profile mismatch
+      # would report the tree as dirty forever.
+      - name: Verify isort
+        id: isort_verify
+        continue-on-error: true
+        run: isort --check-only --profile black .
 
       - name: Commit and Push Changes
         id: isort_commit
